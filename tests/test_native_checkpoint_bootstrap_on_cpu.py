@@ -207,3 +207,53 @@ def test_native_async_reload_releases_cached_allocations_after_the_loader(async_
     if async_enabled:
         expected.extend((("fence",), ("cleanup", True)))
     assert events == expected
+
+
+@pytest.mark.parametrize("async_enabled", [False, True])
+def test_async_checkpoint_prewarms_default_world_communicator(async_enabled, monkeypatch):
+    events = []
+    grad_group = object()
+    world_group = object()
+    probe = object()
+    worker = object.__new__(megatron_workers.AsyncMegatronActorWorker)
+    worker._async_checkpoint_manager = object() if async_enabled else None
+    worker.actor = SimpleNamespace(
+        engine=SimpleNamespace(optimizer=SimpleNamespace(get_grad_stats_parallel_group=lambda: grad_group))
+    )
+    worker._log_cuda_memory = lambda event: events.append(event)
+    monkeypatch.setattr(megatron_workers.torch.distributed, "group", SimpleNamespace(WORLD=world_group))
+    monkeypatch.setattr(megatron_workers.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(megatron_workers.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(megatron_workers.torch.cuda, "synchronize", lambda: events.append("cuda_synchronize"))
+    monkeypatch.setattr(megatron_workers.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(megatron_workers.torch, "zeros", lambda *_args, **_kwargs: probe)
+    monkeypatch.setattr(
+        megatron_workers.torch.distributed,
+        "all_reduce",
+        lambda tensor, *, op, group: events.append(("all_reduce", tensor, op, group)),
+    )
+
+    worker._prewarm_grad_stats_communicators()
+
+    expected = [
+        "grad_stats_nccl_prewarm_before",
+        ("all_reduce", probe, torch.distributed.ReduceOp.SUM, grad_group),
+    ]
+    if async_enabled:
+        expected.append(("all_reduce", probe, torch.distributed.ReduceOp.SUM, world_group))
+    expected.extend(("cuda_synchronize", "grad_stats_nccl_prewarm_after"))
+    assert events == expected
+
+
+def test_async_checkpoint_prewarm_rejects_missing_world_group(monkeypatch):
+    worker = object.__new__(megatron_workers.AsyncMegatronActorWorker)
+    worker._async_checkpoint_manager = object()
+    worker.actor = SimpleNamespace(
+        engine=SimpleNamespace(optimizer=SimpleNamespace(get_grad_stats_parallel_group=lambda: object()))
+    )
+    monkeypatch.setattr(megatron_workers.torch.distributed, "group", SimpleNamespace(WORLD=None))
+    monkeypatch.setattr(megatron_workers.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(megatron_workers.torch.distributed, "is_initialized", lambda: True)
+
+    with pytest.raises(RuntimeError, match="Megatron default process group is missing"):
+        worker._prewarm_grad_stats_communicators()

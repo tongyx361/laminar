@@ -120,8 +120,8 @@ class AsyncMegatronActorWorker(ActorRolloutRefWorker):
             torch.cuda.current_blas_handle()
             self._log_cuda_memory("cublas_prewarm_after")
         super().init_model()
-        checkpoint_manager = self._actor_engine.checkpoint_mananager
-        if bool(checkpoint_manager.checkpoint_config.async_save):
+        checkpoint_manager = getattr(self._actor_engine, "checkpoint_mananager", None)
+        if checkpoint_manager is not None and bool(checkpoint_manager.checkpoint_config.async_save):
             if not checkpoint_manager.use_dist_checkpointing or checkpoint_manager.use_megatron_fsdp:
                 raise ValueError("async checkpoint requires Megatron dist checkpointing without Megatron-FSDP")
             if checkpoint_manager.peft_cls is not None:
@@ -192,6 +192,14 @@ class AsyncMegatronActorWorker(ActorRolloutRefWorker):
         for group in self._grad_stats_parallel_groups(optimizer):
             if all(group is not existing_group for existing_group in groups):
                 groups.append(group)
+        if getattr(self, "_async_checkpoint_manager", None) is not None:
+            # Threaded checkpoint staging and finalization synchronize status on
+            # the default group; prewarm it before training caches GPU segments.
+            world_group = torch.distributed.group.WORLD
+            if world_group is None:
+                raise RuntimeError("Megatron default process group is missing")
+            if all(world_group is not existing_group for existing_group in groups):
+                groups.append(world_group)
         if not groups:
             raise RuntimeError("Megatron optimizer has no grad-stats process groups")
 
